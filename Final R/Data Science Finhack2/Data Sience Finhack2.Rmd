@@ -1,0 +1,448 @@
+---
+title: "Data Science Finhack2"
+author: Anushree Tomar
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+# Problem statement
+
+LTFS receives a lot of requests for its various finance offerings that include housing loan, two-wheeler loan, real estate financing, and microloans. The number of applications received is something that varies a lot with the season. Going through these applications is a manual process and is tedious. Accurately forecasting the number of cases received can help with resource and manpower management resulting into quick response on applications and more efficient processing.
+You have been appointed with the task of forecasting daily cases for the next 3 months for 2 different business segments at the country level keeping in consideration the following major Indian festivals (inclusive but not exhaustive list): Diwali, Dussehra, Ganesh Chaturthi, Navratri, Holi, etc
+
+
+# Data Dictionary
+
+The train data has been provided in the following way:
+
+*	For business segment 1, historical data has been made available at branch ID level
+*	For business segment 2, historical data has been made available at the State level.
+
+
+# Exploratory Data Analysis
+
+# Train data
+
+```{r Import Libraries, message=FALSE, warning=FALSE, paged.print=FALSE,echo=FALSE}
+#R version 3.6.2 
+library(data.table)
+library(lubridate)
+library(ggplot2)
+library(quantmod)
+library(Metrics)
+library(keras)
+library(caret)
+library(xgboost)
+```
+
+```{r,echo=FALSE}
+train<-fread("train_fwYjLYX.csv",stringsAsFactors = T,na.strings = c("NA",""))
+head(train)
+tail(train)
+```
+
+There is an "NA" in zone column. We can identify zone by analyzing combination of state and zone column.
+
+
+```{r,echo=FALSE}
+df<-unique(train[!which(is.na(train$zone)),c("state","zone")])
+df1<-unique(train[which(is.na(train$zone)),c("state","zone")])
+
+df1[which(is.na(df1$zone)),"zone"]<-df[match(df1$state,df$state),"zone"]
+df1
+```
+
+Above list is the unique list of state and missing zone.
+
+```{r,echo=FALSE}
+# Fill Na with with above list
+
+df<-train[!which(is.na(train$zone)),c("state","zone")]
+df1<-train[which(is.na(train$zone)),c("state","zone")]
+
+train[which(is.na(train$zone)),"zone"]<-df[match(df1$state,df$state),"zone"]
+```
+
+# Visualization of data
+
+## Distribution of Business Segment
+
+```{r,echo=FALSE}
+ggplot(train, aes(x = as.factor(train$segment))) +
+  geom_bar(aes(y = (..count..)/sum(..count..),fill=as.factor(train$segment))) +
+  geom_text(aes(y = ((..count..)/sum(..count..)), label = scales::percent((..count..)/sum(..count..))), stat = "count", vjust = -0.3) + theme_classic()+theme(legend.position = "none")+labs(x="Business Segment",y= "Percent of Business Segment")
+
+```
+The Percent of Business Segment-1 is more than Business Segment-2
+
+
+## Number of cases as per Business Segment 
+```{r,echo=FALSE}
+ggplot(train,aes(as.Date(application_date),case_count,fill=case_count))+geom_col()+facet_grid(factor(train$segment))+theme_classic()+labs(x="application_date")
+
+```
+As compared to Business Segment-1 there is more number of cases received in Business Segment-2 on daily basis.
+
+# Zone wise number of cases
+```{r,echo=FALSE}
+ggplot(train,aes(as.Date(application_date),case_count,fill=case_count))+geom_col()+facet_grid(factor(train$zone))+theme_classic()+labs(x="application_date")
+
+```
+
+The Number of case_count is maximum in the SOUTH zone followed by EAST zone.
+
+## Number of branch_id in business segment 1
+```{r,echo=FALSE}
+table(train[segment==1,as.factor(branch_id)])
+```
+
+All branch id having equal count in Business Segment-1
+
+## Number of case_count as per branch_id
+```{r,echo=FALSE}
+new<-train[segment==1,list(case_count=sum(case_count)),by=list(branch_id=as.factor(branch_id))]
+
+ggplot(new,aes(new$branch_id,case_count,fill=new$branch_id))+geom_bar(stat="identity")+theme_classic()+theme(legend.position = "none")+labs(x="branch_id")
+```
+
+```{r,echo=FALSE}
+print("branch_id with min number of case_count")
+
+head(new[order(new$case_count),])
+
+print("branch_id with max number of case_count")
+
+head(new[order(new$case_count,decreasing=T),])
+
+```
+
+
+## Number of state per business segment 
+```{r,echo=FALSE}
+ggplot(train,aes(state,fill=state))+geom_bar()+coord_flip()+facet_grid(factor(train$segment))+theme_classic()+theme(legend.position = "none")
+```
+In Business segment-1 more number of cases recieved but as we saw previously count of number of cases in Business Segment-2 is more than Business Segment-1.
+
+# Feature Engineering
+
+Steps involved in Feature Engineering:-
+
+* Aggregate case_count by application_date
+
+* Extract year,month, weekday and quarter from applicate_date 
+
+* Add [Holiday Indicators](https://www.calendarlabs.com/holidays/india/2019) to the data
+
+* Collect [Stock Information](https://www.ltfs.com/investors.html)
+
+* Collect daily [India / U.S. Foreign Exchange Rate ](https://fred.stlouisfed.org/series/DEXINUS)
+
+
+```{r,echo=FALSE}
+# Extract year, month, quarter
+train<-train[,list("case_count"=sum(case_count)),by=list(application_date,segment)]
+train$application_date<-as.Date(train$application_date)
+train[,":=" (Year=year(train$application_date),Month=month(train$application_date),Day=day(train$application_date),Weekday=wday(train$application_date),Quarter=quarter(train$application_date))]
+# Add holiday indicator
+holiday<-fread('Holiday_list_2017-19.csv')
+holiday$DATE<-as.Date(holiday$DATE,format='%B %d, %Y')
+train$application_date<-as.Date(train$application_date)
+train$holiday<-ifelse(train$application_date %in% holiday$DATE,1,0)
+```
+
+```{r,echo=FALSE}
+#Fetch stock data online
+
+maxDate <- "2017-03-01"
+
+tickers<-c("L&TFH.NS","L&TFH.BO")
+
+LTFH.NS <- as.data.frame(na.omit(getSymbols.yahoo("L&TFH.NS", from = maxDate , to="2019-10-24",auto.assign = F)))
+LTFH.NS$date<-as.Date(rownames(LTFH.NS))
+LTFH.BO<-as.data.frame(na.omit(getSymbols.yahoo("L&TFH.BO", from=maxDate , auto.assign = F,to="2019-10-24")))
+LTFH.BO$date<-as.Date(rownames(LTFH.BO))
+
+# Add closing price to test and train data
+train$LTFH.NS<-ifelse(train$application_date %in% LTFH.NS$date,LTFH.NS$`L&TFH.NS.Close`,0)
+train$LTFH.BO<-ifelse(train$application_date %in% LTFH.BO$date,LTFH.BO$`L&TFH.BO.Close`,0)
+
+```
+
+```{r,echo=FALSE}
+# Add Foreign Exchange
+DEXINUS<-fread("DEXINUS.csv",na.strings = ".")
+
+train$ER<-ifelse(train$application_date %in% as.Date(DEXINUS$DATE),DEXINUS$DEXINUS,0)
+train[which(is.na(train$ER)),"ER"]<-0
+
+head(train)
+```
+
+# Yearly Trend of Case_count
+```{r,echo=FALSE}
+ggplot(train,aes(as.Date(application_date),case_count,fill=factor(train$Year)))+geom_col()+theme_classic()+labs(x="application_date")+theme(legend.position = "none")
+```
+We have data starting from 2017-04 to 2019-07 and Number of case count showing slightly Positive trend with the year. 
+
+# Monthly trend of Case_count
+```{r,echo=FALSE}
+ggplot(train,aes(as.factor(train$Month),case_count,fill=factor(train$Year)))+geom_col()+facet_grid(factor(train$Year))+theme_classic()+labs(x="Month")+theme(legend.position = "none")
+
+```
+In the above graph, we can see that in 2017 the number of cases increasing with the month but in 2018 and 2017 showing ups and down in case_count.
+
+
+# Weekly trend of Case_count
+```{r,echo=FALSE}
+ggplot(train,aes(as.factor(train$Weekday),case_count,fill=factor(train$Year)))+geom_col()+facet_grid(factor(train$Year))+theme_classic()+labs(x="Weekday")+theme(legend.position = "none")
+
+```
+Weekly Analysis of Number of case_count is Almost constant and on Weekday-1 (Sunday) there is vary less number of cases received.
+
+# Quarterly trend of Case_count
+```{r,echo=FALSE}
+ggplot(train,aes(as.factor(train$Quarter),case_count,fill=factor(train$Year)))+geom_col()+facet_grid(factor(train$Year))+theme_classic()+labs(x="Quarter")+theme(legend.position = "none")
+
+```
+Here we can see that in 2017 and  in 2018 there is a slightly positive trend in case_count.But in Q2 of 2019 there is decrease in number of cases.
+
+## Test data
+```{r,echo=FALSE}
+test<-fread("test_1eLl9Yf.csv")
+head(test)
+```
+we need to Forecast for the dates provided in test set for each segment.
+
+# Feature Engineering of test data 
+
+Performed same data pre-processing as train data.
+```{r,echo=FALSE}
+test$application_date<-as.Date(test$application_date)
+test[,":=" (Year=year(test$application_date),Month=month(test$application_date),Day=day(test$application_date),Weekday=wday(test$application_date),Quarter=quarter(test$application_date))]
+
+# Add holiday
+test$holiday<-ifelse(test$application_date %in% holiday$DATE,1,0)
+
+# Add stock
+test$LTFH.NS<-ifelse(test$application_date %in% LTFH.NS$date,LTFH.NS$`L&TFH.NS.Close`,0)
+test$LTFH.BO<-ifelse(test$application_date %in% LTFH.BO$date,LTFH.BO$`L&TFH.BO.Close`,0)
+
+# Add Foreign Exchange Rate 
+test$ER<-ifelse(test$application_date %in% as.Date(DEXINUS$DATE),DEXINUS$DEXINUS,0)
+test[which(is.na(test$ER)),"ER"]<-0
+
+```
+
+
+# Model Building
+
+For Model building we split the Data into train data and test data. We have 3 years of data so for daily forecasting we separate 2019 data as test dataset. 
+
+```{r,echo=FALSE}
+# Business Segment-1
+segment1<-train[segment==1,]
+# Business Segment-2
+segment2<-train[segment==2,]
+
+# split data for Business segment1
+traindata1<-segment1[!year(application_date)==2019,]
+testdata1<-segment1[year(application_date)==2019,]
+
+traindata1[,c("segment","application_date"):=NULL]
+testdata1[,c("segment","application_date"):=NULL]
+
+#split for bisiness segment2
+# split data
+traindata2<-segment2[!year(application_date)==2019,]
+testdata2<-segment2[year(application_date)==2019,]
+
+traindata2[,c("segment","application_date"):=NULL]
+testdata2[,c("segment","application_date"):=NULL]
+
+# process test data
+test1<-test[segment==1,]
+test2<-test[segment==2,]
+#submission<-test[,list(id,application_date,segment)]
+test1[,c("id","application_date","segment"):=NULL]
+test2[,c("id","application_date","segment"):=NULL]
+
+```
+
+## Predictive Model and Evaluation
+
+* Regression  with CNN Model 
+
+First:- Forecast for Business Segment-1
+
+```{r, echo=FALSE}
+
+set.seed(123)
+ 
+xtrain = as.matrix(traindata1[,-1])
+ytrain = as.matrix(traindata1[,1])
+xtest = as.matrix(testdata1[,-1])
+ytest = as.matrix(testdata1[, 1])
+
+ftest1<-as.matrix(test1)
+ftest2<-as.matrix(test2)
+
+``` 
+
+```{r, echo=FALSE}
+#adding another one-dimension
+xtrain = array(xtrain, dim = c(nrow(xtrain), 9, 1))
+xtest = array(xtest, dim = c(nrow(xtest), 9, 1))
+
+ftest1<-array(ftest1, dim = c(nrow(ftest1), 9, 1))
+ftest2<-array(ftest2, dim = c(nrow(ftest2), 9, 1))
+
+```
+
+# Extract the input dimension for the Keras model
+```{r ,echo=FALSE}
+
+in_dim = c(dim(xtrain)[2:3])
+
+print(in_dim)
+```
+
+# Model Fitting
+```{r, echo=FALSE}
+model = keras_model_sequential() %>%
+  layer_conv_1d(filters = 64, kernel_size = 2,
+                input_shape = in_dim, activation = "relu") %>%
+  layer_conv_1d(filters = 64, kernel_size = 2,activation = "relu") %>%
+  layer_conv_1d(filters = 64, kernel_size = 2,activation = "relu") %>%
+  layer_conv_1d(filters = 64, kernel_size = 2,activation = "relu") %>%
+  layer_flatten() %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dense(units = 64, activation = "relu")%>%
+  layer_dense(units = 16, activation = "relu")%>%
+  layer_dense(units = 8, activation = "relu")%>%
+  layer_dense(units = 1, activation = "linear")
+
+model %>% compile(
+  loss = "mse",
+  optimizer = "adam")
+
+model %>% summary()
+ 
+``` 
+
+```{r,echo=FALSE}
+#model %>% fit(xtrain, ytrain, epochs = 1500, batch_size=16, verbose = 0)
+model<-load_model_hdf5("kbs1.h5")
+scores = model %>% evaluate(xtrain, ytrain, verbose = 0)
+print(scores)
+```
+
+
+# Prediction on test data
+```{r, echo=FALSE}
+
+#save_model_hdf5(model,"kbs1.h5")
+ypred = model %>% predict(xtest)
+#final
+pred1<-model %>% predict(ftest1)
+``` 
+
+# Evaluation Metric
+
+The evaluation metric for scoring the forecasts is MAPE (Mean Absolute Percentage Error).
+The final score is calculated using MAPE for both the segments using the formula:
+
+Final Score=0.5*MAPE(Segment-1)+0.5*MAPE(Segment-2)
+
+```{r,echo=FALSE}
+mape(ytest, ypred)*100
+```
+
+
+# Visualize Result
+```{r, echo=FALSE} 
+x_axes = seq(1:length(ypred))
+plot(x_axes, ytest, ylim = c(min(ypred), max(ytest)),
+     col = "burlywood", type = "l", lwd = 2, ylab = "medv")
+lines(x_axes, ypred, col = "red", type = "l", lwd = 2)
+legend("topleft", legend = c("y-test", "y-pred"),
+       col = c("burlywood", "red"), lty = 1, cex=0.7, lwd=2, bty='n') 
+
+```
+
+
+Second:-Forecast for Business Segment-2
+
+Xgboost Model
+
+```{r, echo=FALSE}
+xgbGrid <-  expand.grid(eta = c(0.01,0.1,0.3,1), 
+                            colsample_bytree=c(0.05,0.5,0.7,1),
+                            max_depth=c(2,3,5,6),
+                            nrounds=1000,
+                            gamma=c(1,3,5,7),
+                            min_child_weight=c(0.05,0.5,1,2)
+                            )
+set.seed(123)
+#10 fold cv
+ctrl<-trainControl("cv",number = 10,savePredictions = TRUE)
+#xgb <- train(case_count ~ ., data = traindata2, 
+#                      method = "xgbDART",
+#                      tunegrid= xgbGrid,
+#                      #preProcess=c("scale","center"),
+#                      trControl= ctrl,
+#                      metric="RMSE",
+#                      na.action = na.omit
+#)
+
+``` 
+
+
+# Prediction on test data
+```{r, echo=FALSE}
+#saveRDS(xgb,"xgbBs2.rds")
+xgb<-readRDS("xgbBs2.rds")
+
+ypred2 = predict(xgb, testdata2[,-"case_count"])
+
+ypred2<-as.data.frame(ypred2)
+
+#final
+pred2<-predict(xgb, test2)
+pred2<-as.data.frame(pred2)
+pred1<-as.data.frame(pred1)
+
+# Final prediction
+
+test1$case_count<-round(pred1$V1)
+test2$case_count<-round(pred2$pred2)
+
+model10<-rbind(test1,test2)
+model10<-cbind(test[,c("id","application_date","segment")],model10[,"case_count"])
+#write.csv(model10,"model10.csv",row.names = F)
+#Public score-30.013774017303373
+``` 
+
+# Evaluation
+```{r,echo=FALSE}
+
+mape(testdata2$case_count, ypred2$ypred2)*100
+
+```
+
+# Visualize Result
+```{r, echo=FALSE} 
+x_axes = seq(1:length(ypred2$ypred2))
+plot(x_axes, testdata2$case_count, ylim = c(min(ypred2$ypred2), max(testdata2$case_count)),
+     col = "burlywood", type = "l", lwd = 2, ylab = "medv")
+lines(x_axes, ypred2$ypred2, col = "red", type = "l", lwd = 2)
+legend("topleft", legend = c("y-test", "y-pred"),
+       col = c("burlywood", "red"), lty = 1, cex=0.7, lwd=2, bty='n') 
+
+```
+
+# Conclusion
+
+In the end, we got our best model that can forecast daily cases for the next 3 months for 2 different business segments with MAPE of 49.56% and 34.22% respectively.
+
