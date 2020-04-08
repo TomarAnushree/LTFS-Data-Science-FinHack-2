@@ -72,9 +72,9 @@ Test data is further divided into Public (1st Month) and Private (Next 2 months)
 *	Your initial responses will be checked and scored on the Public data.
 *	The final rankings would be based on your private score which will be published once the competition is over.
 
-## Public score: 30.01     Rank: 298
+## Public score: 30.01     Rank: 286
 
-## Private score: 47.87    Rank: 349
+## Private score: 47.87    Rank: 337
 
 ## Winner's score: 10.00/19.8
 
